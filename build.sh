@@ -17,8 +17,9 @@ if [ ! -e Makefile ]; then
         --with-cuda-toolkit=$CUDA \
         --with-gdrcopy=$PREFIX \
         --with-mpi=$MPI_HOME \
-        --enable-test
-
+        --enable-test \
+        --with-gdstools=$PREFIX \
+        --enable-extended-memops
 fi
 
 make V=1 clean all install
