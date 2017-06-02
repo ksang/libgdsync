@@ -54,6 +54,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <assert.h>
+#include <netdb.h>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -62,6 +63,8 @@
 #include "pingpong.h"
 #include "gpu.h"
 #include "test_utils.h"
+
+
 
 #ifdef USE_PROF
 #include "prof.h"
@@ -101,29 +104,30 @@ enum {
 static int page_size;
 
 struct pingpong_context {
-	struct ibv_context	*context;
-	struct ibv_comp_channel *channel;
-	struct ibv_pd		*pd;
-	struct ibv_mr		*mr;
-	struct ibv_cq		*tx_cq;
-	struct ibv_cq		*rx_cq;
-	struct ibv_qp		*qp;
-	struct gds_qp		*gds_qp;
-	struct ibv_ah		*ah;
-	void			*buf;
-	char			*txbuf;
-        char                    *rxbuf;
-        char                    *rx_flag;
-	int			 size;
-        int                      calc_size;
-	int			 rx_depth;
-	int			 pending;
-	struct ibv_port_attr     portinfo;
-	int                      gpu_id;
-	int                      kernel_duration;
-	int                      peersync;
-	int                      peersync_gpu_cq;
-        int                      consume_rx_cqe;
+	struct ibv_context		*context;
+	struct ibv_comp_channel	*channel;
+	struct ibv_pd			*pd;
+	struct ibv_mr			*mr;
+	struct ibv_cq			*tx_cq;
+	struct ibv_cq			*rx_cq;
+	struct ibv_qp			*qp;
+	struct gds_qp			*gds_qp;
+	struct ibv_ah			*ah;
+	struct ibv_port_attr	portinfo;
+	void 	*buf;
+	char 	*txbuf;
+	char 	*txbuf;
+	char 	*rxbuf;
+	char 	*rx_flag;
+	int		size;
+	int		calc_size;
+	int		rx_depth;
+	int		pending;
+	int		gpu_id;
+	int		kernel_duration;
+	int		peersync;
+	int		peersync_gpu_cq;
+	int		consume_rx_cqe;
 };
 
 static int my_rank, comm_size;
@@ -134,6 +138,74 @@ struct pingpong_dest {
 	int psn;
 	union ibv_gid gid;
 };
+
+/*
+ *  tcp_server_listen
+ * *******************
+ *  Creates a TCP server socket  which listens for incoming connections
+ */
+static int tcp_server_listen(int port){
+	struct addrinfo *res, *t;
+	struct addrinfo hints = {
+		.ai_flags		= AI_PASSIVE,
+		.ai_family		= AF_UNSPEC,
+		.ai_socktype	= SOCK_STREAM
+	};
+
+	char *service;
+	int sockfd = -1;
+	int n, connfd;
+	struct sockaddr_in sin;
+
+	asprintf(&service, "%d", port);
+
+	n = getaddrinfo(NULL, service, &hints, &res);
+
+	sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &n, sizeof n);
+
+    bind(sockfd,res->ai_addr, res->ai_addrlen);
+
+	listen(sockfd, 1);
+
+	connfd = accept(sockfd, NULL, 0);
+
+	freeaddrinfo(res);
+
+	return connfd;
+}
+
+static int tcp_client_connect(char *server, int port)
+{
+	struct addrinfo *res, *t;
+	struct addrinfo hints = {
+		.ai_family		= AF_UNSPEC,
+		.ai_socktype	= SOCK_STREAM
+	};
+
+	char *service;
+	int n;
+	int sockfd = -1;
+	struct sockaddr_in sin;
+
+	asprintf(&service, "%d", data->port);
+
+	getaddrinfo(data->servername, service, &hints, &res);
+
+	for(t = res; t; t = t->ai_next){
+		sockfd = socket(t->ai_family, t->ai_socktype, t->ai_protocol);
+		int r = connect(sockfd,t->ai_addr, t->ai_addrlen);
+		if (r != 0) {
+			fprintf(stderr, "Could not connect to server\n");
+			return 0;
+		}
+	}
+
+	freeaddrinfo(res);
+
+	return sockfd;
+}
 
 static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
 			  int sl, struct pingpong_dest *dest, int sgid_idx)
@@ -561,218 +633,74 @@ static int pp_post_work(struct pingpong_context *ctx, int n_posts, int rcnt, uin
 	return i;
 }
 
-static void usage(const char *argv0)
-{
-	printf("Usage:\n");
-	printf("  %s            start a server and wait for connection\n", argv0);
-	printf("  %s <host>     connect to server at <host>\n", argv0);
-	printf("\n");
-	printf("Options:\n");
-	printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
-	printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
-	printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-	printf("  -s, --size=<size>      size of message to exchange (default 1024)\n");
-	printf("  -r, --rx-depth=<dep>   number of receives to post at a time (default 500)\n");
-	printf("  -n, --iters=<iters>    number of exchanges (default 1000)\n");
-	printf("  -e, --events           sleep on CQ events (default poll)\n");
-	printf("  -g, --gid-idx=<gid index> local port gid index\n");
-	printf("  -S, --gpu-calc-size=<size>  size of GPU compute buffer (default 128KB)\n");
-	printf("  -G, --gpu-id           use specified GPU (default 0)\n");
-	printf("  -B, --batch-length=<n> max batch length (default 20)\n");
-	printf("  -P, --peersync            enable GPUDirect PeerSync support (default enabled)\n");
-	printf("  -C, --peersync-gpu-cq     enable GPUDirect PeerSync GPU CQ support (default disabled)\n");
-	printf("  -D, --peersync-gpu-dbrec  enable QP DBREC on GPU memory (default disabled)\n");
-	printf("  -Q, --consume-rx-cqe      enable GPU consumes RX CQE support (default disabled)\n");
-	printf("  -M, --gpu-sched-mode      set CUDA context sched mode, default (A)UTO, (S)PIN, (Y)IELD, (B)LOCKING\n");
-}
-
 int main(int argc, char *argv[])
 {
-	struct ibv_device      **dev_list;
-	struct ibv_device	*ib_dev;
+	struct ibv_device		**dev_list;
+	struct ibv_device		*ib_dev;
 	struct pingpong_context *ctx;
-	struct pingpong_dest     my_dest;
-	struct pingpong_dest    *rem_dest = NULL;
-	struct timeval           rstart, start, end;
+	struct pingpong_dest	my_dest;
+	struct pingpong_dest	*rem_dest = NULL;
+	struct timeval			rstart, start, end;
 	const char              *ib_devname = NULL;
 	char                    *servername = NULL;
-	int                      port = 18515;
-	int                      ib_port = 1;
-	int                      size = 1024;
-	int                      calc_size = 128*1024;
-	int                      rx_depth = 2*512;
-	int                      iters = 1000;
-	int                      use_event = 0;
-	int                      routs;
-        int                      nposted;
-	int                      rcnt, scnt;
-	int                      num_cq_events = 0;
-	int                      sl = 0;
-	int			 gidx = -1;
-	char			 gid[INET6_ADDRSTRLEN];
-	int                      gpu_id = 0;
-        int                      peersync = 1;
-        int                      peersync_gpu_cq = 0;
-        int                      peersync_gpu_dbrec = 0;
-        int                      warmup = 10;
-        int                      max_batch_len = 20;
-        int                      consume_rx_cqe = 0;
-        int                      sched_mode = CU_CTX_SCHED_AUTO;
-        int                      ret = 0;
+	int						port = 18515;
+	int 					ib_port = 1;
+	int 					size = 1024;
+	int						calc_size = 128*1024;
+	int						rx_depth = 2*512;
+	int						iters = 1000;
+	int						use_event = 0;
+	int						routs;
+	int						nposted;
+	int						rcnt, scnt;
+	int						num_cq_events = 0;
+	int						sl = 0;
+	int						gidx = -1;
+	char			 		gid[INET6_ADDRSTRLEN];
+	int						gpu_id = 0;
+	int						peersync = 1;
+	int						peersync_gpu_cq = 0;
+	int						peersync_gpu_dbrec = 0;
+	int						warmup = 10;
+	int						max_batch_len = 20;
+	int						consume_rx_cqe = 0;
+	int						sched_mode = CU_CTX_SCHED_AUTO;
+	int						ret = 0;
+	// for tcp
+	int 					socketfd
 
-        fprintf(stdout, "libgdsync build version 0x%08x, major=%d minor=%d\n", GDS_API_VERSION, GDS_API_MAJOR_VERSION, GDS_API_MINOR_VERSION);
 
-        int version;
-        ret = gds_query_param(GDS_PARAM_VERSION, &version);
-        if (ret) {
-                fprintf(stderr, "error querying libgdsync version\n");
-                return -1;
-        }
-        fprintf(stdout, "libgdsync queried version 0x%08x\n", version);
-        if (!GDS_API_VERSION_COMPATIBLE(version)) {
-                fprintf(stderr, "incompatible libgdsync version 0x%08x\n", version);
-                return -1;
-        }
+	fprintf(stdout, "libgdsync build version 0x%08x, major=%d minor=%d\n", GDS_API_VERSION, GDS_API_MAJOR_VERSION, GDS_API_MINOR_VERSION);
+
+	int version;
+	ret = gds_query_param(GDS_PARAM_VERSION, &version);
+	if (ret) {
+		fprintf(stderr, "error querying libgdsync version\n");
+		return -1;
+	}
+	fprintf(stdout, "libgdsync queried version 0x%08x\n", version);
+	if (!GDS_API_VERSION_COMPATIBLE(version)) {
+		fprintf(stderr, "incompatible libgdsync version 0x%08x\n", version);
+		return -1;
+	}
 
 	srand48(getpid() * time(NULL));
 
-	while (1) {
-		int c;
-
-		static struct option long_options[] = {
-			{ .name = "port",     .has_arg = 1, .val = 'p' },
-			{ .name = "ib-dev",   .has_arg = 1, .val = 'd' },
-			{ .name = "ib-port",  .has_arg = 1, .val = 'i' },
-			{ .name = "size",     .has_arg = 1, .val = 's' },
-			{ .name = "rx-depth", .has_arg = 1, .val = 'r' },
-			{ .name = "iters",    .has_arg = 1, .val = 'n' },
-			{ .name = "sl",       .has_arg = 1, .val = 'l' },
-			{ .name = "events",   .has_arg = 0, .val = 'e' },
-			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
-			{ .name = "gpu-id",          .has_arg = 1, .val = 'G' },
-			{ .name = "peersync",        .has_arg = 0, .val = 'P' },
-			{ .name = "peersync-gpu-cq", .has_arg = 0, .val = 'C' },
-			{ .name = "peersync-gpu-dbrec", .has_arg = 1, .val = 'D' },
-			{ .name = "gpu-calc-size",   .has_arg = 1, .val = 'S' },
-			{ .name = "batch-length",    .has_arg = 1, .val = 'B' },
-			{ .name = "consume-rx-cqe",  .has_arg = 0, .val = 'Q' },
-			{ .name = "gpu-sched-mode",  .has_arg = 1, .val = 'M' },
-			{ 0 }
-		};
-
-		c = getopt_long(argc, argv, "p:d:i:s:r:n:l:eg:G:S:B:PCDQM:", long_options, NULL);
-		if (c == -1)
-			break;
-
-		switch (c) {
-		case 'p':
-			port = strtol(optarg, NULL, 0);
-			if (port < 0 || port > 65535) {
-				usage(argv[0]);
-                                ret = 1;
-                                exit(EXIT_FAILURE);
-			}
-			break;
-
-		case 'd':
-			ib_devname = strdupa(optarg);
-			break;
-
-		case 'i':
-			ib_port = strtol(optarg, NULL, 0);
-			if (ib_port < 0) {
-				usage(argv[0]);
-				ret = 1;
-                                exit(EXIT_FAILURE);
-			}
-			break;
-
-		case 's':
-			size = strtol(optarg, NULL, 0);
-			break;
-
-		case 'S':
-			calc_size = strtol(optarg, NULL, 0);
-			break;
-
-		case 'r':
-			rx_depth = strtol(optarg, NULL, 0);
-			break;
-
-		case 'n':
-			iters = strtol(optarg, NULL, 0);
-			break;
-
-		case 'l':
-			sl = strtol(optarg, NULL, 0);
-			break;
-
-		case 'e':
-			++use_event;
-			break;
-
-		case 'g':
-			gidx = strtol(optarg, NULL, 0);
-			break;
-
-		case 'G':
-			gpu_id = strtol(optarg, NULL, 0);
-                        printf("INFO: gpu id=%d\n", gpu_id);
-			break;
-
-		case 'B':
-			max_batch_len = strtol(optarg, NULL, 0);
-                        printf("INFO: max_batch_len=%d\n", max_batch_len);
-			break;
-
-		case 'P':
-			peersync = !peersync;
-                        printf("INFO: switching PeerSync %s\n", peersync?"ON":"OFF");
-			break;
-
-		case 'Q':
-			consume_rx_cqe = !consume_rx_cqe;
-                        printf("INFO: switching consume_rx_cqe %s\n", consume_rx_cqe?"ON":"OFF");
-			break;
-
-		case 'C':
-			peersync_gpu_cq = !peersync_gpu_cq;
-                        printf("INFO: switching %s PeerSync GPU CQ\n", peersync_gpu_cq?"ON":"OFF");
-			break;
-
-		case 'D':
-			peersync_gpu_dbrec= !peersync_gpu_dbrec;
-                        printf("INFO: switching %s PeerSync GPU QP DBREC\n", peersync_gpu_dbrec?"ON":"OFF");
-			break;
-
-		case 'M':
-                {
-                        char m = *optarg;
-                        printf("INFO: sched mode '%c'\n", m);
-                        switch (m) {
-                        case 'S': sched_mode = CU_CTX_SCHED_SPIN; break;
-                        case 'Y': sched_mode = CU_CTX_SCHED_YIELD; break;
-                        case 'B': sched_mode = CU_CTX_SCHED_BLOCKING_SYNC; break;
-                        case 'A': sched_mode = CU_CTX_SCHED_AUTO; break;
-                        default: printf("ERROR: unexpected value %c\n", m); exit(EXIT_FAILURE); break;
-                        }
-                }
-                break;
-
-		default:
-			usage(argv[0]);
-			return 1;
-		}
+	if(argc == 2){
+		servername = argv[1];
+	}
+	if(argc > 2){
+		fprintf(stderr, "*Error* Usage: <remote_server>\n");
+		return -1;
 	}
 
-        printf("pid=%d server\n", getpid());
-
-        const char *tags = NULL;
-        if (peersync) {
-                tags = "wait trk|pollrxcq|polltxcq|postrecv|postwork| poketrk";
-        } else {
-                tags = "krn laun|krn sync|postsend|<------>|<------>| sent ev";
-        }
+	if (!servername) {
+		// Server side program
+		printf("pid=%d server starting\n", getpid());
+	} else {
+		// Cliend side
+		printf("[%d] pid=%d client:%s\n", my_rank, getpid(), hostnames[1]);
+	}
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -782,19 +710,9 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-        if (!ib_devname) {
-                // old env var, for compatibility
-                const char *value = getenv("USE_IB_HCA");
-                if (value != NULL) {
-                        printf("[%d] USE_IB_HCA: <%s>\n", my_rank, value);
-                        ib_devname = value;
-                }
-        } else {
-                printf("[%d] requested IB device: <%s>\n", my_rank, ib_devname);
-        }
 
 	if (!ib_devname) {
-                printf("[%d] picking 1st available device\n", my_rank);
+		printf("[%d] picking 1st available device\n", my_rank);
 		ib_dev = *dev_list;
 		if (!ib_dev) {
 			fprintf(stderr, "[%d] No IB devices found\n", my_rank);
@@ -841,12 +759,27 @@ int main(int argc, char *argv[])
 
 	inet_ntop(AF_INET6, &my_dest.gid, gid, sizeof gid);
 	printf("local address:  LID 0x%04x, QPN 0x%06x, PSN 0x%06x: GID %s\n",
-	       my_dest.lid, my_dest.qpn, my_dest.psn, gid);
+	 	my_dest.lid, my_dest.qpn, my_dest.psn, gid);
 
+	if(servername){
+		// client connect
+		sockfd = tcp_client_connect(servername, port);
+	}else{
+		// server listen
+		sockfd = tcp_server_listen(port);
+		if (!sockfd) {
+			fprintf(stderr, "Error start tcp server\n");
+			return 1;
+		}
+	}
 
 	struct pingpong_dest all_dest[4] = {{0,}};
-	//all_dest[0] is local, 1 is remote
 	all_dest[0] = my_dest;
+    rem_dest = all_dest[1];
+	inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
+
+	printf("remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
+		rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid);
 
         {
                 struct ibv_qp_attr attr = {
@@ -858,6 +791,8 @@ int main(int argc, char *argv[])
                         return 1;
                 }
 
+                MPI_Barrier(MPI_COMM_WORLD);
+
                 attr.qp_state	    = IBV_QPS_RTS;
                 attr.sq_psn	    = my_dest.psn;
 
@@ -867,6 +802,8 @@ int main(int argc, char *argv[])
                         fprintf(stderr, "Failed to modify QP to RTS\n");
                         return 1;
                 }
+
+                MPI_Barrier(MPI_COMM_WORLD);
 
                 struct ibv_ah_attr ah_attr = {
                         .is_global     = 0,
@@ -891,6 +828,8 @@ int main(int argc, char *argv[])
                 }
 
         }
+
+        MPI_Barrier(MPI_COMM_WORLD);
 
 	if (gettimeofday(&start, NULL)) {
 		perror("gettimeofday");
@@ -921,7 +860,7 @@ int main(int argc, char *argv[])
                 nposted += n_posted;
                 //prev_batch_len = last_batch_len;
                 last_batch_len = n_posted;
-                printf("[server] batch %d: posted %d sequences\n", batch, n_posted);
+                printf("[%d] batch %d: posted %d sequences\n", my_rank, batch, n_posted);
         }
 
 	ctx->pending = PINGPONG_RECV_WRID;
@@ -939,7 +878,7 @@ int main(int argc, char *argv[])
 		printf("pre-posting took %.2f usec\n", usec);
                 pre_post_us = usec;
 	}
-/* client
+
         if (!my_rank) {
                 puts("");
                 printf("batch info: rx+kernel+tx %d per batch\n", n_posted); // this is the last actually
@@ -950,7 +889,7 @@ int main(int argc, char *argv[])
                 printf("testing....\n");
                 fflush(stdout);
         }
-*/
+
 	if (gettimeofday(&start, NULL)) {
 		perror("gettimeofday");
 		return 1;
@@ -1111,11 +1050,15 @@ int main(int argc, char *argv[])
 
 	//ibv_ack_cq_events(ctx->cq, num_cq_events);
 
+        MPI_Barrier(MPI_COMM_WORLD);
 	if (pp_close_ctx(ctx))
 		ret = 1;
 
 	ibv_free_device_list(dev_list);
 	//free(rem_dest);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Finalize();
 out:
 	return ret;
 }
