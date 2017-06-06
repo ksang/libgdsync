@@ -139,6 +139,15 @@ struct pingpong_dest {
 	union ibv_gid gid;
 };
 
+struct ib_connection {
+    int             	lid;
+    int            	 	qpn;
+    int             	psn;
+	char			 	gid[INET6_ADDRSTRLEN];
+	unsigned 			rkey;
+	unsigned long long 	vaddr;
+};
+
 struct app_data {
 	int							port;
 	int							ib_port;
@@ -151,6 +160,13 @@ struct app_data {
 	struct ibv_device			*ib_dev;
 
 };
+
+static void print_ib_connection(char *conn_name, struct ib_connection *conn){
+
+	printf("%s: LID %#04x, QPN %#06x, PSN %#06x RKey %#08x VAddr %#016Lx\n",
+			conn_name, conn->lid, conn->qpn, conn->psn, conn->rkey, conn->vaddr);
+
+}
 
 /*
  *  tcp_server_listen
@@ -222,13 +238,13 @@ static int tcp_client_connect(struct app_data *data)
 
 static int tcp_exch_ib_connection_info(struct app_data *data){
 
-	char msg[sizeof "0000:000000:000000:00000000:0000000000000000"];
+	char msg[sizeof "0000:000000:000000:00000000:0000000000000000:" + INET6_ADDRSTRLEN];
 	int parsed;
 
 	struct ib_connection *local = &data->local_connection;
 
-	sprintf(msg, "%04x:%06x:%06x:%08x:%016Lx",
-				local->lid, local->qpn, local->psn, local->rkey, local->vaddr);
+	sprintf(msg, "%04x:%06x:%06x:%08x:%016Lx:%s",
+				local->lid, local->qpn, local->psn, local->rkey, local->vaddr, local->gid);
 
 	if(write(data->sockfd, msg, sizeof msg) != sizeof msg){
 		perror("Could not send connection_details to peer");
@@ -252,10 +268,10 @@ static int tcp_exch_ib_connection_info(struct app_data *data){
 
 	struct ib_connection *remote = data->remote_connection;
 
-	parsed = sscanf(msg, "%x:%x:%x:%x:%Lx",
-						&remote->lid, &remote->qpn, &remote->psn, &remote->rkey, &remote->vaddr);
+	parsed = sscanf(msg, "%x:%x:%x:%x:%Lx:%s",
+						&remote->lid, &remote->qpn, &remote->psn, &remote->rkey, &remote->vaddr, &remote->gid);
 
-	if(parsed != 5){
+	if(parsed != 6){
 		fprintf(stderr, "Could not parse message from peer");
 		free(data->remote_connection);
 	}
@@ -772,6 +788,7 @@ int main(int argc, char *argv[])
 
 	page_size = sysconf(_SC_PAGESIZE);
 
+	// init local RDMA environment
 	dev_list = ibv_get_device_list(NULL);
 	if (!dev_list) {
 		perror("Failed to get IB devices list");
@@ -815,20 +832,16 @@ int main(int argc, char *argv[])
 	my_dest.lid = ctx->portinfo.lid;
 	my_dest.qpn = ctx->qp->qp_num;
 	my_dest.psn = lrand48() & 0xffffff;
-
-	if (gidx >= 0) {
-		if (ibv_query_gid(ctx->context, ib_port, gidx, &my_dest.gid)) {
-			fprintf(stderr, "Could not get local gid for gid index "
-								"%d\n", gidx);
-			return 1;
-		}
-	} else
-		memset(&my_dest.gid, 0, sizeof my_dest.gid);
+	if (ibv_query_gid(ctx->context, ib_port, gidx, &my_dest.gid)) {
+		fprintf(stderr, "Could not get local gid");
+		return 1;
+	}
 
 	inet_ntop(AF_INET6, &my_dest.gid, gid, sizeof gid);
 	printf("local address:  LID 0x%04x, QPN 0x%06x, PSN 0x%06x: GID %s\n",
 	 	my_dest.lid, my_dest.qpn, my_dest.psn, gid);
 
+	// exchange client server address via TCP
 	if(servername){
 		// client connect
 		sockfd = tcp_client_connect(&data);
@@ -840,259 +853,258 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-
+	data.local_connection.gid = gid;
+	data.local_connection.lid = my_dest.lid;
+	data.local_connection.qpn = my_dest.qpn;
+	data.local_connection.psn = my_dest.psn;
+	int ret = tcp_exch_ib_connection_info(&data);
+	if (ret != 0) {
+		fprintf(stderr, "Could not exchange connection, tcp_exch_ib_connection");
+		return 1;
+	}
 	struct pingpong_dest all_dest[4] = {{0,}};
 	all_dest[0] = my_dest;
-    rem_dest = all_dest[1];
+    ret = inet_pton(AF_INET6, &data.remote_connection.gid, &rem_dest->gid);
+	if (ret != 0) {
+		fprintf(stderr, "Could not convert remote GID from text to binary");
+		return 1;
+	}
+	rem_dest.lid = data.remote_connection.lid;
+	rem_dest.qpn = data.remote_connection.qpn;
+	rem_dest.psn = data.remote_connection.psn;
+	all_dest[1] = rem_dest;
 	inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
 
 	printf("remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
 		rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid);
 
-        {
-                struct ibv_qp_attr attr = {
-                        .qp_state		= IBV_QPS_RTR
-                };
+	// prepared QP
+	struct ibv_qp_attr attr = {
+		.qp_state		= IBV_QPS_RTR
+	};
 
-                if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE)) {
-                        fprintf(stderr, "Failed to modify QP to RTR\n");
-                        return 1;
-                }
+	if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE)) {
+		fprintf(stderr, "Failed to modify QP to RTR\n");
+		return 1;
+	}
 
-                MPI_Barrier(MPI_COMM_WORLD);
+	attr.qp_state	    = IBV_QPS_RTS;
+	attr.sq_psn	    = my_dest.psn;
 
-                attr.qp_state	    = IBV_QPS_RTS;
-                attr.sq_psn	    = my_dest.psn;
+	if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE|IBV_QP_SQ_PSN)) {
+		fprintf(stderr, "Failed to modify QP to RTS\n");
+		return 1;
+	}
 
-                if (ibv_modify_qp(ctx->qp, &attr,
-                                  IBV_QP_STATE              |
-                                  IBV_QP_SQ_PSN)) {
-                        fprintf(stderr, "Failed to modify QP to RTS\n");
-                        return 1;
-                }
+	struct ibv_ah_attr ah_attr = {
+		.is_global     = 0,
+		.dlid          = rem_dest->lid,
+		.sl            = sl,
+		.src_path_bits = 0,
+		.port_num      = ib_port
+	};
 
-                MPI_Barrier(MPI_COMM_WORLD);
+	ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
+	if (!ctx->ah) {
+		ah_attr.is_global = 1;
+		ah_attr.grh.hop_limit = 1;
+		ah_attr.grh.dgid = rem_dest.gid;
+		ah_attr.grh.sgid_index = 0;
 
-                struct ibv_ah_attr ah_attr = {
-                        .is_global     = 0,
-                        .dlid          = rem_dest->lid,
-                        .sl            = sl,
-                        .src_path_bits = 0,
-                        .port_num      = ib_port
-                };
-
-                ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
-                if (!ctx->ah) {
-            		ah_attr.is_global = 1;
-            		ah_attr.grh.hop_limit = 1;
-            		ah_attr.grh.dgid = my_dest.gid;
-            		ah_attr.grh.sgid_index = 0;
-
-            		ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
-            		if (!ctx->ah) {
-            			fprintf(stderr, "Failed to create AH\n");
-            			return 1;
-            		}
-                }
-
-        }
-
-        MPI_Barrier(MPI_COMM_WORLD);
+		ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
+		if (!ctx->ah) {
+			fprintf(stderr, "Failed to create AH\n");
+			return 1;
+		}
+	}
 
 	if (gettimeofday(&start, NULL)) {
 		perror("gettimeofday");
 		ret = 1;
-                goto out;
+		goto out;
 	}
 
-        // for performance reasons, multiple batches back-to-back are posted here
+	// for performance reasons, multiple batches back-to-back are posted here
 	rcnt = scnt = 0;
-        nposted = 0;
-        routs = 0;
-        const int n_batches = 3;
-        //int prev_batch_len = 0;
-        int last_batch_len = 0;
-        int n_post = 0;
-        int n_posted;
-        int batch;
+	nposted = 0;
+	routs = 0;
+	const int n_batches = 3;
+	//int prev_batch_len = 0;
+	int last_batch_len = 0;
+	int n_post = 0;
+	int n_posted;
+	int batch;
 
-        for (batch=0; batch<n_batches; ++batch) {
-                n_post = min(min(ctx->rx_depth/2, iters-nposted), max_batch_len);
-                n_posted = pp_post_work(ctx, n_post, 0, rem_dest->qpn, servername?1:0);
-                if (n_posted != n_post) {
-                        fprintf(stderr, "ERROR: Couldn't post work, got %d requested %d\n", n_posted, n_post);
-                        ret = 1;
-                        goto out;
-                }
-                routs += n_posted;
-                nposted += n_posted;
-                //prev_batch_len = last_batch_len;
-                last_batch_len = n_posted;
-                printf("[%d] batch %d: posted %d sequences\n", my_rank, batch, n_posted);
-        }
+	for (batch=0; batch<n_batches; ++batch) {
+		n_post = min(min(ctx->rx_depth/2, iters-nposted), max_batch_len);
+		n_posted = pp_post_work(ctx, n_post, 0, rem_dest->qpn, servername?1:0);
+		if (n_posted != n_post) {
+			fprintf(stderr, "ERROR: Couldn't post work, got %d requested %d\n", n_posted, n_post);
+			ret = 1;
+			goto out;
+		}
+		routs += n_posted;
+		nposted += n_posted;
+		//prev_batch_len = last_batch_len;
+		last_batch_len = n_posted;
+		printf("batch %d: posted %d sequences\n",  batch, n_posted);
+	}
 
 	ctx->pending = PINGPONG_RECV_WRID;
-
-        float pre_post_us = 0;
+	float pre_post_us = 0;
 
 	if (gettimeofday(&end, NULL)) {
 		perror("gettimeofday");
 		ret = 1;
-                goto out;
+		goto out;
 	}
-	{
-		float usec = (end.tv_sec - start.tv_sec) * 1000000 +
-			(end.tv_usec - start.tv_usec);
-		printf("pre-posting took %.2f usec\n", usec);
-                pre_post_us = usec;
-	}
+	float usec = (end.tv_sec - start.tv_sec) * 1000000 +
+		(end.tv_usec - start.tv_usec);
+	printf("pre-posting took %.2f usec\n", usec);
+	pre_post_us = usec;
 
-        if (!my_rank) {
-                puts("");
-                printf("batch info: rx+kernel+tx %d per batch\n", n_posted); // this is the last actually
-                printf("pre-posted %d sequences in %d batches\n", nposted, 2);
-                printf("GPU kernel calc buf size: %d\n", ctx->calc_size);
-                printf("iters=%d tx/rx_depth=%d\n", iters, ctx->rx_depth);
-                printf("\n");
-                printf("testing....\n");
-                fflush(stdout);
-        }
+	if (!servername) {
+		puts("");
+		printf("batch info: rx+kernel+tx %d per batch\n", n_posted); // this is the last actually
+		printf("pre-posted %d sequences in %d batches\n", nposted, 2);
+		printf("GPU kernel calc buf size: %d\n", ctx->calc_size);
+		printf("iters=%d tx/rx_depth=%d\n", iters, ctx->rx_depth);
+		printf("\n");
+		printf("testing....\n");
+		fflush(stdout);
+	}
 
 	if (gettimeofday(&start, NULL)) {
 		perror("gettimeofday");
 		return 1;
 	}
-        prof_enable(&prof);
-        prof_idx = 0;
-        int got_error = 0;
-        int iter = 0;
+	prof_enable(&prof);
+	prof_idx = 0;
+	int got_error = 0;
+	int iter = 0;
 	while ((rcnt < iters || scnt < iters) && !got_error) {
-                ++iter;
-                PROF(&prof, prof_idx++);
+		++iter;
+		PROF(&prof, prof_idx++);
 
-                //printf("before tracking\n"); fflush(stdout);
-                int ret = gpu_wait_tracking_event(1000*1000);
-                if (ret == ENOMEM) {
-                        printf("gpu_wait_tracking_event nothing to do (%d)\n", ret);
-                } else if (ret == EAGAIN) {
-                        printf("gpu_wait_tracking_event timout (%d), retrying\n", ret);
-                        prof_reset(&prof);
-                        continue;
-                } else if (ret) {
-                        fprintf(stderr, "gpu_wait_tracking_event failed (%d)\n", ret);
-                        got_error = ret;
-                }
-                //gpu_infoc(20, "after tracking\n");
+		//printf("before tracking\n"); fflush(stdout);
+		int ret = gpu_wait_tracking_event(1000*1000);
+		if (ret == ENOMEM) {
+			printf("gpu_wait_tracking_event nothing to do (%d)\n", ret);
+		} else if (ret == EAGAIN) {
+			printf("gpu_wait_tracking_event timout (%d), retrying\n", ret);
+			prof_reset(&prof);
+			continue;
+		} else if (ret) {
+			fprintf(stderr, "gpu_wait_tracking_event failed (%d)\n", ret);
+			got_error = ret;
+		}
+		//gpu_infoc(20, "after tracking\n");
 
-                PROF(&prof, prof_idx++);
+		PROF(&prof, prof_idx++);
 
-                // don't call poll_cq on events which are still being polled by the GPU
-                int n_rx_ev = 0;
-                if (!ctx->consume_rx_cqe) {
-                        struct ibv_wc wc[max_batch_len];
-                        int ne = 0, i;
+		// don't call poll_cq on events which are still being polled by the GPU
+		int n_rx_ev = 0;
+		if (!ctx->consume_rx_cqe) {
+			struct ibv_wc wc[max_batch_len];
+			int ne = 0, i;
 
-                        ne = ibv_poll_cq(ctx->rx_cq, max_batch_len, wc);
-                        if (ne < 0) {
-                                fprintf(stderr, "poll RX CQ failed %d\n", ne);
-                                return 1;
-                        }
-                        n_rx_ev += ne;
-                        //if (ne) printf("ne=%d\n", ne);
-                        for (i = 0; i < ne; ++i) {
-                                if (wc[i].status != IBV_WC_SUCCESS) {
-                                        fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-                                                ibv_wc_status_str(wc[i].status),
-                                                wc[i].status, (int) wc[i].wr_id);
-                                        return 1;
-                                }
+			ne = ibv_poll_cq(ctx->rx_cq, max_batch_len, wc);
+			if (ne < 0) {
+				fprintf(stderr, "poll RX CQ failed %d\n", ne);
+				return 1;
+			}
+			n_rx_ev += ne;
+			//if (ne) printf("ne=%d\n", ne);
+			for (i = 0; i < ne; ++i) {
+				if (wc[i].status != IBV_WC_SUCCESS) {
+					fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+					ibv_wc_status_str(wc[i].status),
+					wc[i].status, (int) wc[i].wr_id);
+					return 1;
+				}
 
-                                switch ((int) wc[i].wr_id) {
-                                case PINGPONG_RECV_WRID:
-                                        ++rcnt;
-                                        break;
-                                default:
-                                        fprintf(stderr, "Completion for unknown wr_id %d\n",
-                                                (int) wc[i].wr_id);
-                                        return 1;
-                                }
-                        }
-                } else {
-                        n_rx_ev = last_batch_len;
-                        rcnt += last_batch_len;
-                }
+				switch ((int) wc[i].wr_id) {
+					case PINGPONG_RECV_WRID:
+						++rcnt;
+						break;
+					default:
+						fprintf(stderr, "Completion for unknown wr_id %d\n",
+							(int) wc[i].wr_id);
+							return 1;
+				}
+			}
+		} else {
+			n_rx_ev = last_batch_len;
+			rcnt += last_batch_len;
+		}
 
-                PROF(&prof, prof_idx++);
-                int n_tx_ev = 0;
-                {
-                        struct ibv_wc wc[max_batch_len];
-                        int ne, i;
+		PROF(&prof, prof_idx++);
+		int n_tx_ev = 0;
+		struct ibv_wc wc[max_batch_len];
+		int ne, i;
 
-                        ne = ibv_poll_cq(ctx->tx_cq, max_batch_len, wc);
-                        if (ne < 0) {
-                                fprintf(stderr, "poll TX CQ failed %d\n", ne);
-                                return 1;
-                        }
-                        n_tx_ev += ne;
-                        for (i = 0; i < ne; ++i) {
-                                if (wc[i].status != IBV_WC_SUCCESS) {
-                                        fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-                                                ibv_wc_status_str(wc[i].status),
-                                                wc[i].status, (int) wc[i].wr_id);
-                                        return 1;
-                                }
+		ne = ibv_poll_cq(ctx->tx_cq, max_batch_len, wc);
+		if (ne < 0) {
+			fprintf(stderr, "poll TX CQ failed %d\n", ne);
+			return 1;
+		}
+		n_tx_ev += ne;
+		for (i = 0; i < ne; ++i) {
+			if (wc[i].status != IBV_WC_SUCCESS) {
+				fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+				ibv_wc_status_str(wc[i].status),wc[i].status, (int) wc[i].wr_id);
+				return 1;
+			}
 
-                                switch ((int) wc[i].wr_id) {
-                                case PINGPONG_SEND_WRID:
-                                        ++scnt;
-                                        break;
-                                default:
-                                        fprintf(stderr, "Completion for unknown wr_id %d\n",
-                                                (int) wc[i].wr_id);
-                                        ret = 1;
-                                        goto out;
-                                }
-                        }
-                }
-                PROF(&prof, prof_idx++);
-                if (1 && (n_tx_ev || n_rx_ev)) {
-                        //fprintf(stderr, "iter=%d n_rx_ev=%d, n_tx_ev=%d\n", iter, n_rx_ev, n_tx_ev); fflush(stdout);
-                }
-                if (n_tx_ev || n_rx_ev) {
-                        // update counters
-                        routs -= last_batch_len;
-                        //prev_batch_len = last_batch_len;
-                        if (n_tx_ev != last_batch_len)
-                                fprintf(stderr, "[%d] unexpected tx ev %d, batch len %d\n", iter, n_tx_ev, last_batch_len);
-                        if (n_rx_ev != last_batch_len)
-                                fprintf(stderr, "[%d] unexpected rx ev %d, batch len %d\n", iter, n_rx_ev, last_batch_len);
-                        if (nposted < iters) {
-                                //fprintf(stdout, "rcnt=%d scnt=%d routs=%d nposted=%d\n", rcnt, scnt, routs, nposted); fflush(stdout);
-                                // potentially submit new work
-                                n_post = min(min(ctx->rx_depth/2, iters-nposted), max_batch_len);
-                                int n = pp_post_work(ctx, n_post, nposted, rem_dest->qpn, servername?1:0);
-                                if (n != n_post) {
-                                        fprintf(stderr, "ERROR: post_work error (%d) rcnt=%d n_post=%d routs=%d\n", n, rcnt, n_post, routs);
-                                        return 1;
-                                }
-                                last_batch_len = n;
-                                routs += n;
-                                nposted += n;
-                                //fprintf(stdout, "n_post=%d n=%d\n", n_post, n);
-                        }
-                }
-                //usleep(10);
-                PROF(&prof, prof_idx++);
+			switch ((int) wc[i].wr_id) {
+				case PINGPONG_SEND_WRID:
+					++scnt;
+					break;
+				default:
+					fprintf(stderr, "Completion for unknown wr_id %d\n",
+					(int) wc[i].wr_id);
+					ret = 1;
+					goto out;
+			}
+		}
+		PROF(&prof, prof_idx++);
+		if (1 && (n_tx_ev || n_rx_ev)) {
+			//fprintf(stderr, "iter=%d n_rx_ev=%d, n_tx_ev=%d\n", iter, n_rx_ev, n_tx_ev); fflush(stdout);
+		}
+		if (n_tx_ev || n_rx_ev) {
+			// update counters
+			routs -= last_batch_len;
+			//prev_batch_len = last_batch_len;
+			if (n_tx_ev != last_batch_len)
+				fprintf(stderr, "[%d] unexpected tx ev %d, batch len %d\n", iter, n_tx_ev, last_batch_len);
+			if (n_rx_ev != last_batch_len)
+				fprintf(stderr, "[%d] unexpected rx ev %d, batch len %d\n", iter, n_rx_ev, last_batch_len);
+			if (nposted < iters) {
+				//fprintf(stdout, "rcnt=%d scnt=%d routs=%d nposted=%d\n", rcnt, scnt, routs, nposted); fflush(stdout);
+				// potentially submit new work
+				n_post = min(min(ctx->rx_depth/2, iters-nposted), max_batch_len);
+				int n = pp_post_work(ctx, n_post, nposted, rem_dest->qpn, servername?1:0);
+				if (n != n_post) {
+					fprintf(stderr, "ERROR: post_work error (%d) rcnt=%d n_post=%d routs=%d\n", n, rcnt, n_post, routs);
+					return 1;
+				}
+				last_batch_len = n;
+				routs += n;
+				nposted += n;
+				//fprintf(stdout, "n_post=%d n=%d\n", n_post, n);
+			}
+		}
+		//usleep(10);
+		PROF(&prof, prof_idx++);
 		prof_update(&prof);
 		prof_idx = 0;
 
-                //fprintf(stdout, "%d %d\n", rcnt, scnt); fflush(stdout);
+		//fprintf(stdout, "%d %d\n", rcnt, scnt); fflush(stdout);
 
-
-                if (got_error) {
-                        fprintf(stderr, "exiting for error\n");
-                        return 1;
-                }
+		if (got_error) {
+			fprintf(stderr, "exiting for error\n");
+			return 1;
+		}
 	}
 
 	if (gettimeofday(&end, NULL)) {
@@ -1100,33 +1112,28 @@ int main(int argc, char *argv[])
 		ret = 1;
 	}
 
-	{
-		float usec = (end.tv_sec - start.tv_sec) * 1000000 +
-			(end.tv_usec - start.tv_usec) + pre_post_us;
-		long long bytes = (long long) size * iters * 2;
+	float usec = (end.tv_sec - start.tv_sec) * 1000000 +
+		(end.tv_usec - start.tv_usec) + pre_post_us;
+	long long bytes = (long long) size * iters * 2;
 
-		printf("[%d] %lld bytes in %.2f seconds = %.2f Mbit/sec\n",
-		       my_rank, bytes, usec / 1000000., bytes * 8. / usec);
-		printf("[%d] %d iters in %.2f seconds = %.2f usec/iter\n",
-		       my_rank, iters, usec / 1000000., usec / iters);
+	printf("[%d] %lld bytes in %.2f seconds = %.2f Mbit/sec\n",
+		my_rank, bytes, usec / 1000000., bytes * 8. / usec);
+	printf("[%d] %d iters in %.2f seconds = %.2f usec/iter\n",
+		my_rank, iters, usec / 1000000., usec / iters);
+
+	if (prof_enabled(&prof)) {
+		printf("dumping prof\n");
+		prof_dump(&prof);
 	}
-
-        if (prof_enabled(&prof)) {
-                printf("dumping prof\n");
-                prof_dump(&prof);
-        }
 
 	//ibv_ack_cq_events(ctx->cq, num_cq_events);
 
-        MPI_Barrier(MPI_COMM_WORLD);
 	if (pp_close_ctx(ctx))
 		ret = 1;
 
 	ibv_free_device_list(dev_list);
 	//free(rem_dest);
 
-        MPI_Barrier(MPI_COMM_WORLD);
-        MPI_Finalize();
 out:
 	return ret;
 }
