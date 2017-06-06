@@ -139,12 +139,25 @@ struct pingpong_dest {
 	union ibv_gid gid;
 };
 
+struct app_data {
+	int							port;
+	int							ib_port;
+	unsigned            		size;
+	int                 		tx_depth;
+	int 		    			sockfd;
+	char						*servername;
+	struct ib_connection		local_connection;
+	struct ib_connection 		*remote_connection;
+	struct ibv_device			*ib_dev;
+
+};
+
 /*
  *  tcp_server_listen
  * *******************
  *  Creates a TCP server socket  which listens for incoming connections
  */
-static int tcp_server_listen(int port){
+static int tcp_server_listen(truct app_data *data){
 	struct addrinfo *res, *t;
 	struct addrinfo hints = {
 		.ai_flags		= AI_PASSIVE,
@@ -157,7 +170,7 @@ static int tcp_server_listen(int port){
 	int n, connfd;
 	struct sockaddr_in sin;
 
-	asprintf(&service, "%d", port);
+	asprintf(&service, "%d", data->port);
 
 	n = getaddrinfo(NULL, service, &hints, &res);
 
@@ -176,7 +189,7 @@ static int tcp_server_listen(int port){
 	return connfd;
 }
 
-static int tcp_client_connect(char *server, int port)
+static int tcp_client_connect(struct app_data *data)
 {
 	struct addrinfo *res, *t;
 	struct addrinfo hints = {
@@ -205,6 +218,49 @@ static int tcp_client_connect(char *server, int port)
 	freeaddrinfo(res);
 
 	return sockfd;
+}
+
+static int tcp_exch_ib_connection_info(struct app_data *data){
+
+	char msg[sizeof "0000:000000:000000:00000000:0000000000000000"];
+	int parsed;
+
+	struct ib_connection *local = &data->local_connection;
+
+	sprintf(msg, "%04x:%06x:%06x:%08x:%016Lx",
+				local->lid, local->qpn, local->psn, local->rkey, local->vaddr);
+
+	if(write(data->sockfd, msg, sizeof msg) != sizeof msg){
+		perror("Could not send connection_details to peer");
+		return -1;
+	}
+
+	if(read(data->sockfd, msg, sizeof msg) != sizeof msg){
+		perror("Could not receive connection_details to peer");
+		return -1;
+	}
+
+	if(!data->remote_connection){
+		free(data->remote_connection);
+	}
+
+	data->remote_connection = malloc(sizeof(struct ib_connection)
+    if (data->remote_connection == NULL){
+		fprintf(stderr, "Could not allocate memory for remote_connection connection");
+        return -1;
+    }
+
+	struct ib_connection *remote = data->remote_connection;
+
+	parsed = sscanf(msg, "%x:%x:%x:%x:%Lx",
+						&remote->lid, &remote->qpn, &remote->psn, &remote->rkey, &remote->vaddr);
+
+	if(parsed != 5){
+		fprintf(stderr, "Could not parse message from peer");
+		free(data->remote_connection);
+	}
+
+	return 0;
 }
 
 static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
@@ -684,6 +740,17 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
+    struct app_data	 	 data = {
+		.port	    		= 18515,
+		.ib_port    		= 1,
+		.size       		= 65536,
+		.tx_depth   		= 100,
+		.servername 		= NULL,
+		.remote_connection 	= NULL,
+		.ib_dev     		= NULL
+
+	};
+
 	srand48(getpid() * time(NULL));
 
 	if(argc == 2){
@@ -701,6 +768,7 @@ int main(int argc, char *argv[])
 		// Cliend side
 		printf("[%d] pid=%d client:%s\n", my_rank, getpid(), hostnames[1]);
 	}
+    data.servername = servername;
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -763,10 +831,10 @@ int main(int argc, char *argv[])
 
 	if(servername){
 		// client connect
-		sockfd = tcp_client_connect(servername, port);
+		sockfd = tcp_client_connect(&data);
 	}else{
 		// server listen
-		sockfd = tcp_server_listen(port);
+		sockfd = tcp_server_listen(&data);
 		if (!sockfd) {
 			fprintf(stderr, "Error start tcp server\n");
 			return 1;
