@@ -130,8 +130,6 @@ struct pingpong_context {
 	int		consume_rx_cqe;
 };
 
-static int my_rank, comm_size;
-
 struct pingpong_dest {
 	int lid;
 	int qpn;
@@ -609,7 +607,7 @@ static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn)
 
 static int pp_post_gpu_send(struct pingpong_context *ctx, uint32_t qpn)
 {
-        int ret = 0;
+	int ret = 0;
 	struct ibv_sge list = {
 		.addr	= (uintptr_t) ctx->txbuf,
 		.length = ctx->size,
@@ -623,85 +621,82 @@ static int pp_post_gpu_send(struct pingpong_context *ctx, uint32_t qpn)
 		.exp_send_flags = IBV_EXP_SEND_SIGNALED,
 		.wr         = {
 			.ud = {
-				 .ah          = ctx->ah,
-				 .remote_qpn  = qpn,
-				 .remote_qkey = 0x11111111
-			 }
+				.ah          = ctx->ah,
+				.remote_qpn  = qpn,
+				.remote_qkey = 0x11111111
+			}
 		},
 		.comp_mask = 0
 	};
 	struct ibv_exp_send_wr *bad_ewr;
-        //printf("gpu_post_send_on_stream\n");
-        return gds_stream_queue_send(gpu_stream, ctx->gds_qp, &ewr, &bad_ewr);
+	//printf("gpu_post_send_on_stream\n");
+	return gds_stream_queue_send(gpu_stream, ctx->gds_qp, &ewr, &bad_ewr);
 }
 
-static int pp_post_work(struct pingpong_context *ctx, int n_posts, int rcnt, uint32_t qpn, int is_client)
-{
+static int pp_post_work(struct pingpong_context *ctx, int n_posts, int rcnt, uint32_t qpn, int is_client){
 	int i, ret = 0;
-        int posted_recv = 0;
+	int posted_recv = 0;
 
-        //printf("post_work posting %d\n", n_posts);
+	//printf("post_work posting %d\n", n_posts);
 
-        if (n_posts <= 0)
-                return 0;
+	if (n_posts <= 0)
+		return 0;
 
-        posted_recv = pp_post_recv(ctx, n_posts);
-        if (posted_recv < 0) {
-                fprintf(stderr,"ERROR: can't post recv (%d) n_posts=%d is_client=%d\n",
-                        posted_recv, n_posts, is_client);
-                exit(EXIT_FAILURE);
-                return 0;
-        } else if (posted_recv != n_posts) {
-                fprintf(stderr,"ERROR: couldn't post all recvs (%d posted, %d requested)\n", posted_recv, n_posts);
-                if (!posted_recv)
-                        return 0;
-        }
+	posted_recv = pp_post_recv(ctx, n_posts);
+	if (posted_recv < 0) {
+		fprintf(stderr,"ERROR: can't post recv (%d) n_posts=%d is_client=%d\n",
+			posted_recv, n_posts, is_client);
+		exit(EXIT_FAILURE);
+		return 0;
+	} else if (posted_recv != n_posts) {
+		printf(stderr,"ERROR: couldn't post all recvs (%d posted, %d requested)\n", posted_recv, n_posts);
+		if (!posted_recv)
+			return 0;
+	}
 
-        PROF(&prof, prof_idx++);
+	PROF(&prof, prof_idx++);
 
 	for (i = 0; i < posted_recv; ++i) {
-                if (is_client) {
+		if (is_client) {
 
-                        ret = pp_post_gpu_send(ctx, qpn);
-                        if (ret) {
-                                fprintf(stderr,"ERROR: can't post GPU send (%d) posted_recv=%d posted_so_far=%d is_client=%d \n",
-                                        ret, posted_recv, i, is_client);
-                                i = -ret;
-                                break;
-                        }
+			ret = pp_post_gpu_send(ctx, qpn);
+			if (ret) {
+				fprintf(stderr,"ERROR: can't post GPU send (%d) posted_recv=%d posted_so_far=%d is_client=%d \n",
+					ret, posted_recv, i, is_client);
+				i = -ret;
+				break;
+			}
 
-                        ret = gds_stream_wait_cq(gpu_stream, &ctx->gds_qp->recv_cq, ctx->consume_rx_cqe);
-                        if (ret) {
-                                fprintf(stderr,"ERROR: error in gpu_post_poll_cq (%d)\n", ret);
-                                i = -ret;
-                                break;
-                        }
-                        if (ctx->calc_size)
-                                gpu_launch_kernel(ctx->calc_size, ctx->peersync);
-                } else {
+			ret = gds_stream_wait_cq(gpu_stream, &ctx->gds_qp->recv_cq, ctx->consume_rx_cqe);
+			if (ret) {
+				fprintf(stderr,"ERROR: error in gpu_post_poll_cq (%d)\n", ret);
+				i = -ret;
+				break;
+			}
+			if (ctx->calc_size)
+				gpu_launch_kernel(ctx->calc_size, ctx->peersync);
+		} else {
+			ret = gds_stream_wait_cq(gpu_stream, &ctx->gds_qp->recv_cq, ctx->consume_rx_cqe);
+			if (ret) {
+				fprintf(stderr, "ERROR: error in gpu_post_poll_cq (%d)\n", ret);
+				i = -ret;
+				break;
+			}
+			if (ctx->calc_size)
+				gpu_launch_kernel(ctx->calc_size, ctx->peersync);
+			ret = pp_post_gpu_send(ctx, qpn);
+			if (ret) {
+				fprintf(stderr, "ERROR: can't post GPU send\n");
+				i = -ret;
+				break;
+			}
+		}
+	}
 
-                        ret = gds_stream_wait_cq(gpu_stream, &ctx->gds_qp->recv_cq, ctx->consume_rx_cqe);
-                        if (ret) {
-                                fprintf(stderr, "ERROR: error in gpu_post_poll_cq (%d)\n", ret);
-                                i = -ret;
-                                break;
-                        }
-                        if (ctx->calc_size)
-                                gpu_launch_kernel(ctx->calc_size, ctx->peersync);
+	PROF(&prof, prof_idx++);
 
-                        ret = pp_post_gpu_send(ctx, qpn);
-                        if (ret) {
-                                fprintf(stderr, "ERROR: can't post GPU send\n");
-                                i = -ret;
-                                break;
-                        }
-                }
-        }
-
-        PROF(&prof, prof_idx++);
-
-        gpu_post_release_tracking_event();
-        //sleep(1);
+	gpu_post_release_tracking_event();
+	//sleep(1);
 	return i;
 }
 
@@ -782,7 +777,7 @@ int main(int argc, char *argv[])
 		printf("pid=%d server starting\n", getpid());
 	} else {
 		// Cliend side
-		printf("[%d] pid=%d client:%s\n", my_rank, getpid(), hostnames[1]);
+		printf("pid=%d client:%s\n", getpid(), hostnames[1]);
 	}
     data.servername = servername;
 
@@ -797,10 +792,10 @@ int main(int argc, char *argv[])
 
 
 	if (!ib_devname) {
-		printf("[%d] picking 1st available device\n", my_rank);
+		printf("picking 1st available device\n");
 		ib_dev = *dev_list;
 		if (!ib_dev) {
-			fprintf(stderr, "[%d] No IB devices found\n", my_rank);
+			fprintf(stderr, "No IB devices found\n");
 			return 1;
 		}
 	} else {
@@ -1018,8 +1013,8 @@ int main(int argc, char *argv[])
 			for (i = 0; i < ne; ++i) {
 				if (wc[i].status != IBV_WC_SUCCESS) {
 					fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-					ibv_wc_status_str(wc[i].status),
-					wc[i].status, (int) wc[i].wr_id);
+						ibv_wc_status_str(wc[i].status),
+						wc[i].status, (int) wc[i].wr_id);
 					return 1;
 				}
 
@@ -1052,8 +1047,8 @@ int main(int argc, char *argv[])
 		for (i = 0; i < ne; ++i) {
 			if (wc[i].status != IBV_WC_SUCCESS) {
 				fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-				ibv_wc_status_str(wc[i].status),wc[i].status, (int) wc[i].wr_id);
-				return 1;
+					ibv_wc_status_str(wc[i].status),wc[i].status, (int) wc[i].wr_id);
+					return 1;
 			}
 
 			switch ((int) wc[i].wr_id) {
@@ -1062,7 +1057,7 @@ int main(int argc, char *argv[])
 					break;
 				default:
 					fprintf(stderr, "Completion for unknown wr_id %d\n",
-					(int) wc[i].wr_id);
+						(int) wc[i].wr_id);
 					ret = 1;
 					goto out;
 			}
@@ -1116,10 +1111,10 @@ int main(int argc, char *argv[])
 		(end.tv_usec - start.tv_usec) + pre_post_us;
 	long long bytes = (long long) size * iters * 2;
 
-	printf("[%d] %lld bytes in %.2f seconds = %.2f Mbit/sec\n",
-		my_rank, bytes, usec / 1000000., bytes * 8. / usec);
-	printf("[%d] %d iters in %.2f seconds = %.2f usec/iter\n",
-		my_rank, iters, usec / 1000000., usec / iters);
+	printf("%lld bytes in %.2f seconds = %.2f Mbit/sec\n",
+		bytes, usec / 1000000., bytes * 8. / usec);
+	printf(" %d iters in %.2f seconds = %.2f usec/iter\n",
+		iters, usec / 1000000., usec / iters);
 
 	if (prof_enabled(&prof)) {
 		printf("dumping prof\n");
