@@ -116,7 +116,6 @@ struct pingpong_context {
 	struct ibv_port_attr	portinfo;
 	void 	*buf;
 	char 	*txbuf;
-	char 	*txbuf;
 	char 	*rxbuf;
 	char 	*rx_flag;
 	int		size;
@@ -171,7 +170,7 @@ static void print_ib_connection(char *conn_name, struct ib_connection *conn){
  * *******************
  *  Creates a TCP server socket  which listens for incoming connections
  */
-static int tcp_server_listen(truct app_data *data){
+static int tcp_server_listen(struct app_data *data){
 	struct addrinfo *res, *t;
 	struct addrinfo hints = {
 		.ai_flags		= AI_PASSIVE,
@@ -258,7 +257,7 @@ static int tcp_exch_ib_connection_info(struct app_data *data){
 		free(data->remote_connection);
 	}
 
-	data->remote_connection = malloc(sizeof(struct ib_connection)
+	data->remote_connection = malloc(sizeof(struct ib_connection));
     if (data->remote_connection == NULL){
 		fprintf(stderr, "Could not allocate memory for remote_connection connection");
         return -1;
@@ -734,7 +733,7 @@ int main(int argc, char *argv[])
 	int						sched_mode = CU_CTX_SCHED_AUTO;
 	int						ret = 0;
 	// for tcp
-	int 					socketfd
+	int 					sockfd;
 
 
 	fprintf(stdout, "libgdsync build version 0x%08x, major=%d minor=%d\n", GDS_API_VERSION, GDS_API_MAJOR_VERSION, GDS_API_MINOR_VERSION);
@@ -777,7 +776,7 @@ int main(int argc, char *argv[])
 		printf("pid=%d server starting\n", getpid());
 	} else {
 		// Cliend side
-		printf("pid=%d client:%s\n", getpid(), hostnames[1]);
+		printf("pid=%d client:%s\n", getpid(), servername);
 	}
     data.servername = servername;
 
@@ -848,26 +847,26 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-	data.local_connection.gid = gid;
+	strcpy(data.local_connection.gid, gid);
 	data.local_connection.lid = my_dest.lid;
 	data.local_connection.qpn = my_dest.qpn;
 	data.local_connection.psn = my_dest.psn;
-	int ret = tcp_exch_ib_connection_info(&data);
+	ret = tcp_exch_ib_connection_info(&data);
 	if (ret != 0) {
 		fprintf(stderr, "Could not exchange connection, tcp_exch_ib_connection");
 		return 1;
 	}
-	struct pingpong_dest all_dest[4] = {{0,}};
-	all_dest[0] = my_dest;
-    ret = inet_pton(AF_INET6, &data.remote_connection.gid, &rem_dest->gid);
+
+
+    ret = inet_pton(AF_INET6, &data.remote_connection->gid, &rem_dest->gid);
 	if (ret != 0) {
 		fprintf(stderr, "Could not convert remote GID from text to binary");
 		return 1;
 	}
-	rem_dest.lid = data.remote_connection.lid;
-	rem_dest.qpn = data.remote_connection.qpn;
-	rem_dest.psn = data.remote_connection.psn;
-	all_dest[1] = rem_dest;
+	rem_dest->lid = data.remote_connection->lid;
+	rem_dest->qpn = data.remote_connection->qpn;
+	rem_dest->psn = data.remote_connection->psn;
+
 	inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
 
 	printf("remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
@@ -883,7 +882,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	attr.qp_state	    = IBV_QPS_RTS;
+	attr.qp_state	= IBV_QPS_RTS;
 	attr.sq_psn	    = my_dest.psn;
 
 	if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE|IBV_QP_SQ_PSN)) {
@@ -903,7 +902,7 @@ int main(int argc, char *argv[])
 	if (!ctx->ah) {
 		ah_attr.is_global = 1;
 		ah_attr.grh.hop_limit = 1;
-		ah_attr.grh.dgid = rem_dest.gid;
+		ah_attr.grh.dgid = rem_dest->gid;
 		ah_attr.grh.sgid_index = 0;
 
 		ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
@@ -1107,7 +1106,7 @@ int main(int argc, char *argv[])
 		ret = 1;
 	}
 
-	float usec = (end.tv_sec - start.tv_sec) * 1000000 +
+	usec = (end.tv_sec - start.tv_sec) * 1000000 +
 		(end.tv_usec - start.tv_usec) + pre_post_us;
 	long long bytes = (long long) size * iters * 2;
 
