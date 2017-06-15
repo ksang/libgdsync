@@ -782,6 +782,7 @@ int main(int argc, char *argv[])
 		printf("pid=%d client:%s\n", getpid(), servername);
 	}
     data.servername = servername;
+	data.port = port;
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -856,14 +857,14 @@ int main(int argc, char *argv[])
 	data.local_connection.psn = my_dest.psn;
 	ret = tcp_exch_ib_connection_info(&data);
 	if (ret != 0) {
-		fprintf(stderr, "Could not exchange connection, tcp_exch_ib_connection");
+		fprintf(stderr, "Could not exchange connection, tcp_exch_ib_connection\n");
 		return 1;
 	}
 
 
     ret = inet_pton(AF_INET6, &data.remote_connection->gid, &rem_dest->gid);
 	if (ret != 0) {
-		fprintf(stderr, "Could not convert remote GID from text to binary");
+		fprintf(stderr, "Could not convert remote GID from text to binary\n");
 		return 1;
 	}
 	rem_dest->lid = data.remote_connection->lid;
