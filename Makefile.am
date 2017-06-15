@@ -48,7 +48,7 @@ tests_gds_kernel_loopback_latency_SOURCES = tests/gds_kernel_loopback_latency.c 
 tests_gds_kernel_loopback_latency_LDADD = $(top_builddir)/src/libgdsync.la $(LIBGDSTOOLS) -lgdrapi -lcuda -lcudart
 
 tests_gds_cs_kernel_latency_SOURCES = tests/gds_cs_kernel_latency.c tests/pingpong.c tests/gpu.cpp tests/gpu_kernels.cu
-tests_gds_kernel_loopback_latency_LDADD = $(top_builddir)/src/libgdsync.la $(LIBGDSTOOLS) -lgdrapi -lcuda -lcudart
+tests_gds_cs_kernel_latency_LDADD = $(top_builddir)/src/libgdsync.la $(LIBGDSTOOLS) -lgdrapi -lcuda -lcudart
 
 SUFFIXES= .cu
 

@@ -235,13 +235,16 @@ static int tcp_client_connect(struct app_data *data)
 
 static int tcp_exch_ib_connection_info(struct app_data *data){
 
-	char msg[sizeof "0000:000000:000000:00000000:0000000000000000:" + INET6_ADDRSTRLEN];
+	char msg[sizeof "0000:000000:000000:00000000:0000000000000000:" + INET6_ADDRSTRLEN+1];
 	int parsed;
 
 	struct ib_connection *local = &data->local_connection;
+	char gid_str[INET6_ADDRSTRLEN+1];
+	gid_str[INET6_ADDRSTRLEN+1] = '\0';
+	strcpy(gid_str, local->gid);
 
 	sprintf(msg, "%04x:%06x:%06x:%08x:%016Lx:%s",
-				local->lid, local->qpn, local->psn, local->rkey, local->vaddr, local->gid);
+				local->lid, local->qpn, local->psn, local->rkey, local->vaddr, gid_str);
 
 	if(write(data->sockfd, msg, sizeof msg) != sizeof msg){
 		perror("Could not send connection_details to peer");
@@ -259,15 +262,15 @@ static int tcp_exch_ib_connection_info(struct app_data *data){
 
 	data->remote_connection = malloc(sizeof(struct ib_connection));
     if (data->remote_connection == NULL){
-		fprintf(stderr, "Could not allocate memory for remote_connection connection");
+		fprintf(stderr, "Could not allocate memory for remote_connection connection\n");
         return -1;
     }
 
 	struct ib_connection *remote = data->remote_connection;
 
 	parsed = sscanf(msg, "%x:%x:%x:%x:%Lx:%s",
-						&remote->lid, &remote->qpn, &remote->psn, &remote->rkey, &remote->vaddr, &remote->gid);
-
+						&remote->lid, &remote->qpn, &remote->psn, &remote->rkey, &remote->vaddr, &gid_str);
+	strncpy(remote->gid, gid_str, INET6_ADDRSTRLEN);
 	if(parsed != 6){
 		fprintf(stderr, "Could not parse message from peer");
 		free(data->remote_connection);
@@ -721,7 +724,7 @@ int main(int argc, char *argv[])
 	int						rcnt, scnt;
 	int						num_cq_events = 0;
 	int						sl = 0;
-	int						gidx = -1;
+	int						gidx = 0;
 	char			 		gid[INET6_ADDRSTRLEN];
 	int						gpu_id = 0;
 	int						peersync = 1;
@@ -827,7 +830,7 @@ int main(int argc, char *argv[])
 	my_dest.qpn = ctx->qp->qp_num;
 	my_dest.psn = lrand48() & 0xffffff;
 	if (ibv_query_gid(ctx->context, ib_port, gidx, &my_dest.gid)) {
-		fprintf(stderr, "Could not get local gid");
+		fprintf(stderr, "Could not get local gid\n");
 		return 1;
 	}
 
